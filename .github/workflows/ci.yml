@@ -9,6 +9,22 @@ on:
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: filevault_test
+          POSTGRES_USER: filevault
+          POSTGRES_PASSWORD: filevault
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U filevault"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://filevault:filevault@localhost:5432/filevault_test
     defaults:
       run:
         working-directory: backend
@@ -35,6 +51,6 @@ jobs:
         with:
           node-version: "20"
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: npm ci --legacy-peer-deps
       - name: Build
         run: npm run build

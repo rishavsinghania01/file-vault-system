@@ -49,18 +49,45 @@ const FileSearch: React.FC<FileSearchProps> = ({ filters, onChange }) => {
       startDate: '',
       endDate: '',
       ordering: filters.ordering,
+      searchMode: filters.searchMode,
     });
   };
 
   return (
     <div className="mb-6 rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+      <div className="mb-3 flex gap-2" role="group" aria-label="Search mode">
+        <button
+          onClick={() => update('searchMode', 'filename')}
+          className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
+            filters.searchMode === 'filename'
+              ? 'bg-primary-600 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+          }`}
+        >
+          Filename
+        </button>
+        <button
+          onClick={() => update('searchMode', 'meaning')}
+          className={`rounded-lg px-3 py-1.5 text-sm font-medium ${
+            filters.searchMode === 'meaning'
+              ? 'bg-primary-600 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+          }`}
+        >
+          Meaning
+        </button>
+      </div>
       <div className="relative mb-4">
         <MagnifyingGlassIcon className="pointer-events-none absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-gray-400" />
         <input
           type="text"
           value={searchInput}
           onChange={(e) => setSearchInput(e.target.value)}
-          placeholder="Search files by name..."
+          placeholder={
+            filters.searchMode === 'meaning'
+              ? 'Describe the document you want to find...'
+              : 'Search files by name...'
+          }
           className="w-full rounded-lg border border-gray-300 py-2 pl-10 pr-4 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
         />
       </div>
