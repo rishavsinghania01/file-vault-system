@@ -11,8 +11,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-semantic.txt ./
+RUN pip install --no-cache-dir -r requirements-semantic.txt
 
 # Project source
 COPY . .

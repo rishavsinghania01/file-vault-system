@@ -7,9 +7,9 @@ export interface FileItem {
   size: number;
   uploaded_at: string;
   hash: string | null;
-  original: string | null;
   is_duplicate: boolean;
   duplicate_count: number;
+  semantic_score: number | null;
 }
 
 export interface FileStatsData {
@@ -34,6 +34,7 @@ export interface FileFilters {
   startDate: string;
   endDate: string;
   ordering: string;
+  searchMode: 'filename' | 'meaning';
 }
 
 export interface PaginatedResponse<T> {
