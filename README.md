@@ -1,23 +1,27 @@
 # File Vault System
 
-A full-stack file storage application built with **React (TypeScript)** and **Django REST Framework**, focused on two things: never storing the same bytes twice, and making it fast to find a file again once it's in the vault.
+A full-stack file storage application built with **React (TypeScript)**, **Django REST Framework** and **PostgreSQL**. It keeps each user's file catalogue private, stores identical bytes once, and supports both filename filtering and embedding-based search by meaning.
 
 ## Features
 
 - **Drag-and-drop upload** with per-file progress, multi-file support, and instant feedback on whether a file was new or a detected duplicate.
 - **Content-based deduplication** – every upload is hashed with SHA-256. If identical content already exists, a lightweight reference row is created instead of writing the bytes to disk again, and the UI reports how much storage that saved.
-- **Search & filtering** – search by filename and filter by file type, size range, and upload date, all combinable and backed by database indexes for fast lookups even as the vault grows.
+- **Separate blob and reference storage** – `StoredBlob` owns the physical object while each `File` row is a user-owned reference with its own filename and upload time. Users can reuse the same blob without seeing one another's references.
+- **Semantic search** – searchable text is extracted from text files and PDFs, encoded with a Sentence Transformers model, and ranked against the query with cosine similarity.
+- **User isolation** – JWT authentication scopes listing, filtering, searching, downloading, statistics and deletion to the signed-in user.
+- **Search & filtering** – search by filename and combine file type, size, and upload-date filters; owner, type, date, and filename metadata are indexed in the database.
 - **Storage savings dashboard** – live stats on total files, duplicates detected, storage used, and storage saved.
-- **Safe deletes** – deleting a file that other duplicate references point to promotes the oldest reference to own the physical file instead of breaking it; deleting a file's last copy removes it from disk too.
+- **Safe deletes** – deleting a reference leaves a shared blob intact; deleting its final reference removes the physical object.
 - **Friendly downloads** – files are stored on disk under generated UUIDs, but download responses restore the original filename.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 18, TypeScript, TanStack Query, Axios, Tailwind CSS, Heroicons |
+| Frontend | React 18, TypeScript, Vite, TanStack Query, Axios, Tailwind CSS |
 | Backend | Django 5, Django REST Framework, django-filter |
-| Database | SQLite |
+| Database | PostgreSQL 16 (SQLite fallback for lightweight local tests) |
+| Search | Sentence Transformers embeddings and cosine similarity |
 | Infra | Docker & Docker Compose, Gunicorn, WhiteNoise |
 
 ## Project Structure
@@ -27,13 +31,14 @@ file-vault-system/
 ├── backend/                     # Django REST API
 │   ├── core/                    # Project settings & root URLs
 │   ├── files/                   # File vault app
-│   │   ├── models.py            # File model + hashing helper
+│   │   ├── models.py            # StoredBlob and per-user File reference models
+│   │   ├── services.py          # text extraction, embeddings and cosine similarity
 │   │   ├── serializers.py       # DRF serializers
 │   │   ├── views.py             # Upload/dedup, search/filter, stats, delete, download
 │   │   ├── filters.py           # django-filter FilterSet powering search & filters
 │   │   ├── urls.py
 │   │   ├── admin.py
-│   │   └── tests.py             # Dedup, search/filter, and delete-promotion tests
+│   │   └── tests.py             # auth, isolation, dedup, search and lifecycle tests
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── frontend/                    # React application
@@ -43,7 +48,7 @@ file-vault-system/
 │       ├── types/file.ts        # Shared TypeScript types
 │       ├── hooks/                # useDebouncedValue
 │       └── utils/format.ts      # Byte/date formatting helpers
-├── docker-compose.yml
+├── docker-compose.yml           # frontend, backend and PostgreSQL
 └── .github/workflows/ci.yml     # Backend tests + frontend build on push/PR
 ```
 
@@ -68,6 +73,7 @@ cd backend
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+pip install -r requirements-semantic.txt
 cp .env.example .env            # optional, defaults work out of the box
 python manage.py migrate
 python manage.py runserver
@@ -82,16 +88,22 @@ cp .env.example .env.local      # optional, defaults to http://localhost:8000/ap
 npm start
 ```
 
-## How Deduplication Works
+## Blob and Reference Storage
 
-Every upload is streamed through a SHA-256 hash before it's saved (`files/models.py::compute_file_hash`). The API then checks whether a **non-duplicate** file with that hash already exists:
+Every upload is streamed through a SHA-256 hash before it is saved (`files/models.py::compute_file_hash`). `StoredBlob.sha256` is unique, so identical content resolves to one physical object:
 
-- **New content** → the file is written to `media/uploads/<uuid>.<ext>` and a `File` row is created with its hash.
-- **Matching content** → a new `File` row is created that points at the existing row via `original` and stores **no file of its own**. The response tells the client how many bytes were saved.
+- **New content** → one `StoredBlob` is written to `media/blobs/<uuid>.<ext>` and a user-owned `File` reference points to it.
+- **Matching content** → only another user-owned `File` reference is created; it points to the existing blob and stores no second physical copy.
 
-Deleting a file that other rows depend on doesn't orphan them: `FileViewSet._delete_instance` promotes the oldest duplicate to own the physical file before removing the requested row, and only unlinks the file from disk when it truly has no more references.
+The API never returns another user's reference. Blob reuse is an internal storage decision and does not reveal the other user's filename or metadata. A physical object is deleted only after its final reference is removed.
 
-`GET /api/files/stats/` aggregates this into `storage_used_bytes` (bytes actually on disk), `storage_saved_bytes` (bytes avoided thanks to dedup), and a `savings_percentage`.
+`GET /api/files/stats/` calculates storage used and saved for the signed-in user's references.
+
+## How Semantic Search Works
+
+For supported text formats and PDFs, the upload pipeline extracts text and creates a normalised document embedding with `sentence-transformers/all-MiniLM-L6-v2`. `GET /api/files/semantic-search/?q=payment+terms` embeds the query, computes cosine similarity against the signed-in user's indexed files, and returns the strongest matches first. Binary files without extractable text remain available through normal filename and metadata filters.
+
+To index blobs created before semantic search was enabled, run `python manage.py reindex_file_embeddings`. Add `--force` to rebuild every existing embedding after changing models.
 
 ## How Search & Filtering Works
 
@@ -112,6 +124,8 @@ Filters are combinable (`?file_type=pdf&min_size=1000&search=invoice`) and imple
 
 | Method | Endpoint | Description |
 |---|---|---|
+| `POST` | `/api/auth/register/` | Create an account and receive JWT access/refresh tokens |
+| `POST` | `/api/auth/token/` | Sign in and receive JWT access/refresh tokens |
 | `GET` | `/api/files/` | List files (paginated, filterable, see above) |
 | `POST` | `/api/files/` | Upload a file (`multipart/form-data`, field `file`) |
 | `GET` | `/api/files/<id>/` | File metadata |
@@ -119,6 +133,7 @@ Filters are combinable (`?file_type=pdf&min_size=1000&search=invoice`) and imple
 | `GET` | `/api/files/<id>/download/` | Download the file with its original filename |
 | `GET` | `/api/files/stats/` | Aggregate storage & dedup stats |
 | `GET` | `/api/files/file_types/` | Distinct file extensions currently stored (for filter UI) |
+| `GET` | `/api/files/semantic-search/?q=...` | Rank the user's indexed files by semantic similarity |
 
 ## Running Tests
 
@@ -127,14 +142,14 @@ cd backend
 python manage.py test
 ```
 
-Covers: new uploads, duplicate detection, mixed-content uploads, storage-savings stats, search, filtering (including combined filters), and delete-with-promotion behavior.
+Covers: registration, authentication enforcement, user isolation, one-blob deduplication, semantic ranking, storage-savings statistics, filtering and last-reference cleanup. Embedding generation is replaced with deterministic vectors in tests, so the test suite does not download a model.
 
 ## Configuration
 
 Both apps read configuration from environment variables (see `backend/.env.example` and `frontend/.env.example`):
 
-- `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `MAX_UPLOAD_SIZE_BYTES` (backend)
-- `REACT_APP_API_URL` (frontend)
+- `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DATABASE_URL`, `MAX_UPLOAD_SIZE_BYTES`, `FILE_EMBEDDING_MODEL` (backend)
+- `VITE_API_URL` (frontend)
 
 ## License
 

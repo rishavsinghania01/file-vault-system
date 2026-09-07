@@ -1,14 +1,20 @@
+from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password
+from django.urls import reverse
 from rest_framework import serializers
 
 from .models import File
 
 
 class FileSerializer(serializers.ModelSerializer):
-    """Read/write serializer used for list, retrieve and create responses."""
-
+    file = serializers.FileField(write_only=True, required=False)
     file_url = serializers.SerializerMethodField()
-    is_duplicate = serializers.SerializerMethodField()
+    content_type = serializers.CharField(source="blob.content_type", read_only=True)
+    size = serializers.IntegerField(source="blob.size", read_only=True)
+    hash = serializers.CharField(source="blob.sha256", read_only=True)
+    is_duplicate = serializers.BooleanField(source="reused_blob", read_only=True)
     duplicate_count = serializers.SerializerMethodField()
+    semantic_score = serializers.SerializerMethodField()
 
     class Meta:
         model = File
@@ -22,41 +28,43 @@ class FileSerializer(serializers.ModelSerializer):
             "size",
             "uploaded_at",
             "hash",
-            "original",
             "is_duplicate",
             "duplicate_count",
+            "semantic_score",
         ]
-        read_only_fields = [
-            "id",
-            "uploaded_at",
-            "size",
-            "hash",
-            "original",
-            "file_url",
-            "content_type",
-        ]
-        extra_kwargs = {
-            "file": {"write_only": True, "required": False},
-        }
+        read_only_fields = fields
 
     def get_file_url(self, obj):
-        target = obj.effective_file()
-        if not target:
-            return None
         request = self.context.get("request")
-        url = target.url
-        return request.build_absolute_uri(url) if request else url
-
-    def get_is_duplicate(self, obj):
-        return obj.is_duplicate
+        path = reverse("file-download", kwargs={"pk": obj.pk})
+        return request.build_absolute_uri(path) if request else path
 
     def get_duplicate_count(self, obj):
-        # Prefer an annotated value (set by the view's queryset) to avoid
-        # issuing one extra query per row when listing files.
-        annotated = getattr(obj, "duplicate_count_annotated", None)
-        if annotated is not None:
-            return annotated
-        return obj.duplicates.count() if not obj.is_duplicate else 0
+        count = getattr(obj, "same_owner_reference_count", None)
+        if count is not None:
+            return max(count - 1, 0)
+        if not obj.owner_id or not obj.blob_id:
+            return 0
+        return obj.blob.references.filter(owner_id=obj.owner_id).exclude(pk=obj.pk).count()
+
+    def get_semantic_score(self, obj):
+        score = getattr(obj, "semantic_score", None)
+        return round(score, 4) if score is not None else None
+
+
+class RegisterSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=150)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    password = serializers.CharField(write_only=True, validators=[validate_password])
+
+    def validate_username(self, value):
+        user_model = get_user_model()
+        if user_model.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError("A user with this username already exists.")
+        return value
+
+    def create(self, validated_data):
+        return get_user_model().objects.create_user(**validated_data)
 
 
 class FileStatsSerializer(serializers.Serializer):

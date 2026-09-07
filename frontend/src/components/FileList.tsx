@@ -6,7 +6,7 @@ import {
   DocumentIcon,
   TrashIcon,
 } from '@heroicons/react/24/outline';
-import { deleteFile, getDownloadUrl, ListFilesParams, listFiles } from '../services/api';
+import { deleteFile, downloadFile, ListFilesParams, listFiles, semanticSearch } from '../services/api';
 import { FileFilters } from '../types/file';
 import { bytesFromUnit, formatBytes, formatDate } from '../utils/format';
 
@@ -39,11 +39,15 @@ const FileList: React.FC<FileListProps> = ({ filters }) => {
     filters.startDate,
     filters.endDate,
     filters.ordering,
+    filters.searchMode,
   ]);
 
   const { data, isLoading, isError } = useQuery({
     queryKey: ['files', params],
-    queryFn: () => listFiles(params),
+    queryFn: () =>
+      filters.searchMode === 'meaning' && filters.search
+        ? semanticSearch(filters.search, params)
+        : listFiles(params),
     placeholderData: (previous) => previous,
   });
 
@@ -101,16 +105,17 @@ const FileList: React.FC<FileListProps> = ({ filters }) => {
               <p className="text-sm text-gray-400">
                 {formatBytes(file.size)} • {file.file_type ? `.${file.file_type}` : 'unknown type'} •{' '}
                 {formatDate(file.uploaded_at)}
+                {file.semantic_score !== null && ` • ${(file.semantic_score * 100).toFixed(1)}% semantic match`}
               </p>
             </div>
             <div className="flex flex-shrink-0 items-center gap-1">
-              <a
-                href={getDownloadUrl(file.id)}
+              <button
+                onClick={() => void downloadFile(file.id, file.original_filename)}
                 className="rounded-lg p-2 text-gray-400 hover:bg-primary-50 hover:text-primary-600"
                 title="Download"
               >
                 <ArrowDownTrayIcon className="h-5 w-5" />
-              </a>
+              </button>
               <button
                 onClick={() => handleDelete(file.id, file.original_filename)}
                 className="rounded-lg p-2 text-gray-400 hover:bg-red-50 hover:text-red-600"
@@ -123,7 +128,7 @@ const FileList: React.FC<FileListProps> = ({ filters }) => {
         ))}
       </ul>
 
-      {data && data.count > 0 && (
+      {data && data.count > 0 && filters.searchMode === 'filename' && (
         <div className="flex items-center justify-between border-t border-gray-200 px-4 py-3 text-sm text-gray-500">
           <span>
             Page {page} of {totalPages}

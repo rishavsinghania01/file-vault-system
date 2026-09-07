@@ -3,7 +3,10 @@ Django settings for the File Vault System backend.
 """
 
 import os
+from datetime import timedelta
 from pathlib import Path
+
+import dj_database_url
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -67,18 +70,16 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "core.wsgi.application"
 
-# Database
-# SQLite needs its parent directory to exist before it will create the file,
-# so make sure it's there regardless of whether this is a fresh local clone
-# or a container (the Docker start.sh also does this, redundantly but safely).
+# Database. Docker and production use PostgreSQL; SQLite remains available for
+# a quick local test by setting DATABASE_URL=sqlite:///path/to/db.sqlite3.
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": os.path.join(DATA_DIR, "db.sqlite3"),
-    }
+    "default": dj_database_url.config(
+        default=f"sqlite:///{os.path.join(DATA_DIR, 'db.sqlite3')}",
+        conn_max_age=600,
+        conn_health_checks=True,
+    )
 }
 
 # Password validation
@@ -107,12 +108,25 @@ MEDIA_ROOT = os.path.join(BASE_DIR, "media")
 # Maximum accepted upload size (bytes) - 100 MB by default, override via env
 MAX_UPLOAD_SIZE = int(os.environ.get("MAX_UPLOAD_SIZE_BYTES", 100 * 1024 * 1024))
 FILE_UPLOAD_MAX_MEMORY_SIZE = 5 * 1024 * 1024  # stream anything bigger than 5MB to disk
+FILE_EMBEDDING_MODEL = os.environ.get(
+    "FILE_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
+MAX_EMBEDDING_CHARACTERS = int(os.environ.get("MAX_EMBEDDING_CHARACTERS", 120_000))
+MAX_EXTRACTED_TEXT_CHARACTERS = int(
+    os.environ.get("MAX_EXTRACTED_TEXT_CHARACTERS", 500_000)
+)
+SEMANTIC_SEARCH_CANDIDATE_LIMIT = int(
+    os.environ.get("SEMANTIC_SEARCH_CANDIDATE_LIMIT", 1000)
+)
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # REST Framework
 REST_FRAMEWORK = {
-    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "DEFAULT_PARSER_CLASSES": [
         "rest_framework.parsers.JSONParser",
         "rest_framework.parsers.MultiPartParser",
@@ -120,6 +134,11 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 12,
+}
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
 }
 
 # CORS
