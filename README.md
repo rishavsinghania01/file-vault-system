@@ -1,155 +1,233 @@
 # File Vault System
 
-A full-stack file storage application built with **React (TypeScript)**, **Django REST Framework** and **PostgreSQL**. It keeps each user's file catalogue private, stores identical bytes once, and supports both filename filtering and embedding-based search by meaning.
+A full-stack file store where identical bytes are written once no matter how many people upload them, each user still sees only their own files, and search works by meaning as well as by filename.
+
+React (TypeScript) · Django REST Framework · PostgreSQL · JWT · sentence-transformers
+
+---
+
+## The part worth reading
+
+Two users uploading the same 40 MB PDF should cost 40 MB, not 80. Getting that right is the whole design, and it lives in two decisions.
+
+### 1. A blob is not a file
+
+The schema splits physical storage from what the user sees (`backend/files/models.py`):
+
+```
+StoredBlob — one per distinct content      File — one per user, per upload
+  id             uuid  ◄──────────────────── blob               FK, on_delete=PROTECT
+  file           media/blobs/<uuid>.<ext>    owner              FK → auth user
+  sha256         unique, indexed             original_filename  "Q3 report.pdf"
+  size           bytes                       file_type          "pdf"
+  content_type                               uploaded_at
+  extracted_text                             reused_blob        bool
+  embedding      json (384 floats)
+```
+
+One `StoredBlob` per distinct content. One `File` per user per upload. Two people who upload the same document get two `File` rows — their own filenames, their own timestamps, each invisible to the other — pointing at one object on disk.
+
+Putting `extracted_text` and `embedding` on the blob rather than the reference means the text extraction and the embedding also happen **once per distinct document**, not once per upload. Deduplication saves the CPU as well as the bytes.
+
+`on_delete=PROTECT` on the reference's blob FK (`models.py:72`) makes the database refuse to delete a blob that still has references, so the cleanup path below cannot orphan a file someone is still using.
+
+### 2. The unique constraint decides, not the code
+
+The upload path (`backend/files/views.py:53`) streams the upload through SHA-256 in 1 MB chunks (`models.py:29`, so a large file is never held in memory), looks for an existing blob with that digest, and creates one if there is none.
+
+That lookup-then-insert is a race: two simultaneous uploads of the same new file can both find nothing. The code does not try to win the race with a lock — it lets Postgres settle it, because `sha256` is `unique`:
+
+```python
+# views.py:89
+try:
+    with transaction.atomic():
+        candidate.save(force_insert=True)
+    blob = candidate
+except IntegrityError:
+    if candidate.file:
+        candidate.file.delete(save=False)          # drop the object we just wrote
+    blob = StoredBlob.objects.get(sha256=file_hash)  # use the winner's blob
+    reused_blob = True
+```
+
+The loser cleans up the bytes it wrote and adopts the winner's blob. Both uploads succeed, both users get their reference, and exactly one physical copy exists. The invariant is held by the database constraint, which is the only thing that can hold it under concurrency.
+
+Deletion is the same idea from the other end (`views.py:117`):
+
+```python
+with transaction.atomic():
+    reference.delete()
+    blob = StoredBlob.objects.select_for_update().filter(pk=blob_id).first()
+    if blob and not blob.references.exists():
+        blob.file.delete(save=False)
+        blob.delete()
+```
+
+`select_for_update()` takes a row lock on the blob, so a concurrent upload cannot attach a new reference in the window between "are there any references left?" and the delete. Deleting your copy of a shared file never disturbs anyone else's; deleting the last reference is what removes the object from disk.
+
+---
 
 ## Features
 
-- **Drag-and-drop upload** with per-file progress, multi-file support, and instant feedback on whether a file was new or a detected duplicate.
-- **Content-based deduplication** – every upload is hashed with SHA-256. If identical content already exists, a lightweight reference row is created instead of writing the bytes to disk again, and the UI reports how much storage that saved.
-- **Separate blob and reference storage** – `StoredBlob` owns the physical object while each `File` row is a user-owned reference with its own filename and upload time. Users can reuse the same blob without seeing one another's references.
-- **Semantic search** – searchable text is extracted from text files and PDFs, encoded with a Sentence Transformers model, and ranked against the query with cosine similarity.
-- **User isolation** – JWT authentication scopes listing, filtering, searching, downloading, statistics and deletion to the signed-in user.
-- **Search & filtering** – search by filename and combine file type, size, and upload-date filters; owner, type, date, and filename metadata are indexed in the database.
-- **Storage savings dashboard** – live stats on total files, duplicates detected, storage used, and storage saved.
-- **Safe deletes** – deleting a reference leaves a shared blob intact; deleting its final reference removes the physical object.
-- **Friendly downloads** – files are stored on disk under generated UUIDs, but download responses restore the original filename.
+- **Content-based deduplication** — SHA-256 of the bytes, a unique constraint, and one physical copy per distinct content. The upload response says whether the file was new or a duplicate and how many bytes that saved.
+- **User isolation** — every list, filter, search, download, stat and delete is scoped to the signed-in user by `get_queryset` (`views.py:37`). You never see another user's filename, metadata or reference, though the upload response does reveal that identical content already existed — see [what this does not do](#what-this-does-not-do).
+- **Semantic search** — text is extracted from text formats and PDFs, embedded once per blob, and ranked against the query by cosine similarity.
+- **Search and filtering** — filename search combined with file type, size range and upload-date range, all against indexed columns.
+- **Storage dashboard** — total files, unique files, duplicates, storage used, storage saved, savings percentage.
+- **Drag-and-drop upload** with per-file progress and multi-file support.
+- **Friendly downloads** — objects are stored under generated UUIDs so the disk never exposes a filename, and the download response restores the original one.
 
-## Tech Stack
+## Tech stack
 
 | Layer | Technology |
 |---|---|
 | Frontend | React 18, TypeScript, Vite, TanStack Query, Axios, Tailwind CSS |
-| Backend | Django 5, Django REST Framework, django-filter |
-| Database | PostgreSQL 16 (SQLite fallback for lightweight local tests) |
-| Search | Sentence Transformers embeddings and cosine similarity |
-| Infra | Docker & Docker Compose, Gunicorn, WhiteNoise |
+| Backend | Django 5, Django REST Framework, django-filter, SimpleJWT |
+| Database | PostgreSQL 16 (SQLite accepted via `DATABASE_URL` for a quick local run) |
+| Search | `sentence-transformers/all-MiniLM-L6-v2`, cosine similarity |
+| Infra | Docker Compose, Gunicorn, WhiteNoise, GitHub Actions |
 
-## Project Structure
+---
 
-```
-file-vault-system/
-├── backend/                     # Django REST API
-│   ├── core/                    # Project settings & root URLs
-│   ├── files/                   # File vault app
-│   │   ├── models.py            # StoredBlob and per-user File reference models
-│   │   ├── services.py          # text extraction, embeddings and cosine similarity
-│   │   ├── serializers.py       # DRF serializers
-│   │   ├── views.py             # Upload/dedup, search/filter, stats, delete, download
-│   │   ├── filters.py           # django-filter FilterSet powering search & filters
-│   │   ├── urls.py
-│   │   ├── admin.py
-│   │   └── tests.py             # auth, isolation, dedup, search and lifecycle tests
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/                    # React application
-│   └── src/
-│       ├── components/          # FileUpload, FileStats, FileSearch, FileList
-│       ├── services/api.ts      # Axios client
-│       ├── types/file.ts        # Shared TypeScript types
-│       ├── hooks/                # useDebouncedValue
-│       └── utils/format.ts      # Byte/date formatting helpers
-├── docker-compose.yml           # frontend, backend and PostgreSQL
-└── .github/workflows/ci.yml     # Backend tests + frontend build on push/PR
-```
+## Getting started
 
-## Getting Started
-
-### Option A: Docker (recommended)
+### Docker
 
 ```bash
 docker-compose up --build
 ```
 
-- Frontend: http://localhost:3000
-- Backend API: http://localhost:8000/api
-- Django admin: http://localhost:8000/admin
+Frontend `http://localhost:3000` · API `http://localhost:8000/api` · admin `http://localhost:8000/admin`
 
-### Option B: Local development
-
-**Backend**
+### Local
 
 ```bash
 cd backend
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+python -m venv venv && source venv/bin/activate     # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-pip install -r requirements-semantic.txt
-cp .env.example .env            # optional, defaults work out of the box
+pip install -r requirements-semantic.txt            # torch + sentence-transformers
+cp .env.example .env                                # optional, defaults work
 python manage.py migrate
 python manage.py runserver
 ```
 
-**Frontend** (in a separate terminal)
-
 ```bash
 cd frontend
 npm install
-cp .env.example .env.local      # optional, defaults to http://localhost:8000/api
+cp .env.example .env.local                          # optional, defaults to localhost:8000/api
 npm start
 ```
 
-## Blob and Reference Storage
+The backend runs without `requirements-semantic.txt`; semantic search then returns `503` with an explanation while everything else works (`services.py:13`).
 
-Every upload is streamed through a SHA-256 hash before it is saved (`files/models.py::compute_file_hash`). `StoredBlob.sha256` is unique, so identical content resolves to one physical object:
+---
 
-- **New content** → one `StoredBlob` is written to `media/blobs/<uuid>.<ext>` and a user-owned `File` reference points to it.
-- **Matching content** → only another user-owned `File` reference is created; it points to the existing blob and stores no second physical copy.
+## API
 
-The API never returns another user's reference. Blob reuse is an internal storage decision and does not reveal the other user's filename or metadata. A physical object is deleted only after its final reference is removed.
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/auth/register/` | Create an account, receive JWT access and refresh tokens |
+| `POST` | `/api/auth/token/` | Sign in, receive tokens |
+| `POST` | `/api/auth/token/refresh/` | Exchange a refresh token |
+| `GET` | `/api/files/` | List the caller's files — paginated, filterable, sortable |
+| `POST` | `/api/files/` | Upload (`multipart/form-data`, field `file`) |
+| `GET` | `/api/files/<id>/` | One file's metadata |
+| `DELETE` | `/api/files/<id>/` | Delete the caller's reference; the blob goes only with its last reference |
+| `GET` | `/api/files/<id>/download/` | Download, with the original filename restored |
+| `GET` | `/api/files/stats/` | Storage used, storage saved, duplicate count |
+| `GET` | `/api/files/file_types/` | Distinct extensions the caller has, for the filter UI |
+| `GET` | `/api/files/semantic-search/?q=…` | Rank the caller's indexed files by meaning |
 
-`GET /api/files/stats/` calculates storage used and saved for the signed-in user's references.
+### Filtering
 
-## How Semantic Search Works
-
-For supported text formats and PDFs, the upload pipeline extracts text and creates a normalised document embedding with `sentence-transformers/all-MiniLM-L6-v2`. `GET /api/files/semantic-search/?q=payment+terms` embeds the query, computes cosine similarity against the signed-in user's indexed files, and returns the strongest matches first. Binary files without extractable text remain available through normal filename and metadata filters.
-
-To index blobs created before semantic search was enabled, run `python manage.py reindex_file_embeddings`. Add `--force` to rebuild every existing embedding after changing models.
-
-## How Search & Filtering Works
-
-`GET /api/files/` accepts any combination of:
+`GET /api/files/` accepts any combination:
 
 | Param | Meaning |
 |---|---|
 | `search` | Case-insensitive filename match |
 | `file_type` | One or more extensions, comma-separated (`pdf,png`) |
-| `min_size` / `max_size` | Size range in bytes |
-| `start_date` / `end_date` | Upload date range (ISO 8601) |
-| `ordering` | `uploaded_at`, `size`, or `original_filename`, prefix with `-` for descending |
-| `page` | Page number (12 results per page) |
+| `min_size` / `max_size` | Size in bytes |
+| `start_date` / `end_date` | Upload date range, ISO 8601 |
+| `ordering` | `uploaded_at`, `size`, `original_filename`; prefix `-` to reverse |
+| `page` | 12 results per page |
 
-Filters are combinable (`?file_type=pdf&min_size=1000&search=invoice`) and implemented with `django-filter` against fields that all carry database indexes (`files/models.py::Meta.indexes`), so filtering stays fast as the file count grows.
+Filters combine (`?file_type=pdf&min_size=1000&search=invoice`) and every column they touch is indexed, including three composite indexes on `(owner, uploaded_at)`, `(owner, original_filename)` and `(owner, file_type)` (`models.py:82`) — the owner column is in each one because every query is owner-scoped first.
 
-## API Reference
+---
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/auth/register/` | Create an account and receive JWT access/refresh tokens |
-| `POST` | `/api/auth/token/` | Sign in and receive JWT access/refresh tokens |
-| `GET` | `/api/files/` | List files (paginated, filterable, see above) |
-| `POST` | `/api/files/` | Upload a file (`multipart/form-data`, field `file`) |
-| `GET` | `/api/files/<id>/` | File metadata |
-| `DELETE` | `/api/files/<id>/` | Delete a file (promotes a duplicate if needed) |
-| `GET` | `/api/files/<id>/download/` | Download the file with its original filename |
-| `GET` | `/api/files/stats/` | Aggregate storage & dedup stats |
-| `GET` | `/api/files/file_types/` | Distinct file extensions currently stored (for filter UI) |
-| `GET` | `/api/files/semantic-search/?q=...` | Rank the user's indexed files by semantic similarity |
+## Semantic search
 
-## Running Tests
+On the first upload of a given content, text is extracted — PDFs via `pypdf`, plus a whitelist of text formats (`services.py:45`) — capped at 500k characters, and embedded with `all-MiniLM-L6-v2` into a normalised 384-dimension vector stored on the blob. The model is loaded once per process (`lru_cache`, `services.py:13`).
+
+`GET /api/files/semantic-search/?q=payment+terms` embeds the query the same way, then scores the caller's files by cosine similarity and returns the best matches. Binary files with no extractable text simply have no embedding and stay findable by filename and metadata.
+
+To index blobs created before semantic search existed:
 
 ```bash
-cd backend
-python manage.py test
+python manage.py reindex_file_embeddings          # --force rebuilds every embedding
 ```
 
-Covers: registration, authentication enforcement, user isolation, one-blob deduplication, semantic ranking, storage-savings statistics, filtering and last-reference cleanup. Embedding generation is replaced with deterministic vectors in tests, so the test suite does not download a model.
+---
+
+## Tests
+
+```bash
+cd backend && python manage.py test
+```
+
+Twelve tests covering registration, authentication enforcement, cross-user isolation, one-blob deduplication, non-deduplication of different content, storage-savings arithmetic, semantic ranking, filename and size filtering, and both halves of the delete rule — that a shared blob survives one reference being deleted, and that the last deletion removes it.
+
+Embeddings are replaced with deterministic vectors in the tests, so the suite never downloads a model. CI (`.github/workflows/ci.yml`) runs them against a real PostgreSQL 16 service container, which matters here: the deduplication tests are only meaningful against a database that actually enforces the unique constraint.
+
+---
+
+## What this does not do
+
+**Semantic search is a linear scan, not a vector index.** Every query loads up to `SEMANTIC_SEARCH_CANDIDATE_LIMIT` (default 1000) of the caller's embeddings and scores them in Python (`views.py:147`). That is fine for a personal vault and wrong for a large one — `pgvector` with an HNSW index, and the similarity computed in the database, is the upgrade.
+
+**Deduplication is global, and that is observable.** Blobs are shared across all users, so an upload response of `"duplicate": true` tells you that this exact content already existed somewhere in the system. That is a real side channel — it is how you could confirm a suspected file is held by someone — and it is inherent to cross-user dedup rather than a bug here. The options are to accept it, scope dedup per user, or stop reporting duplicate status to the uploader.
+
+**Storage is the local filesystem.** `media/blobs/` via Django's default storage. S3 or another object store is a settings change plus a migration of existing objects.
+
+**Uploads are not scanned.** Type is taken from the extension and the browser's `content_type`; nothing inspects the bytes for malware or verifies the claimed type.
+
+**No sharing, folders, versioning or soft delete.** A delete is immediate and permanent for that reference.
+
+---
+
+## Project structure
+
+```
+file-vault-system/
+├── backend/
+│   ├── core/                     settings, root urls
+│   ├── files/
+│   │   ├── models.py             StoredBlob, File, compute_file_hash
+│   │   ├── views.py              upload/dedup, delete, download, search, stats
+│   │   ├── services.py           text extraction, embeddings, cosine similarity
+│   │   ├── serializers.py        response shapes
+│   │   ├── filters.py            django-filter FilterSet
+│   │   ├── auth_views.py         registration
+│   │   ├── tests.py              12 tests
+│   │   └── management/commands/reindex_file_embeddings.py
+│   ├── requirements.txt
+│   └── requirements-semantic.txt
+├── frontend/src/
+│   ├── components/               AuthPanel, FileUpload, FileStats, FileSearch, FileList
+│   ├── services/api.ts           Axios client
+│   ├── hooks/                    useDebouncedValue
+│   └── utils/format.ts
+├── docker-compose.yml
+└── .github/workflows/ci.yml
+```
 
 ## Configuration
 
-Both apps read configuration from environment variables (see `backend/.env.example` and `frontend/.env.example`):
+Both apps read environment variables; see `backend/.env.example` and `frontend/.env.example`.
 
-- `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DATABASE_URL`, `MAX_UPLOAD_SIZE_BYTES`, `FILE_EMBEDDING_MODEL` (backend)
-- `VITE_API_URL` (frontend)
+Backend — `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DATABASE_URL`, `MAX_UPLOAD_SIZE_BYTES` (default 100 MB), `FILE_EMBEDDING_MODEL`, `MAX_EMBEDDING_CHARACTERS`, `MAX_EXTRACTED_TEXT_CHARACTERS`, `SEMANTIC_SEARCH_CANDIDATE_LIMIT`.
+
+Frontend — `VITE_API_URL`.
 
 ## License
 
