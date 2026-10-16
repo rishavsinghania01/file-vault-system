@@ -13,7 +13,7 @@ Two users uploading the same 40 MB PDF should cost 40 MB of disk. Two decisions 
 The schema splits physical storage from what the user sees (`backend/files/models.py`):
 
 ```
-StoredBlob — one per distinct content      File — one per user, per upload
+StoredBlob: one per distinct content       File: one per user, per upload
   id             uuid  ◄──────────────────── blob               FK, on_delete=PROTECT
   file           media/blobs/<uuid>.<ext>    owner              FK → auth user
   sha256         unique, indexed             original_filename  "Q3 report.pdf"
